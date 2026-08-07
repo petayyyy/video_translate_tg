@@ -1,0 +1,22 @@
+# Секреты и локальные настройки
+.env
+config.yaml
+nginx/certs/
+
+# Данные бота
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Редакторы
+.idea/
+.vscode/
+*.swp

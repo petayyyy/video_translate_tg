@@ -1,0 +1,202 @@
+# =============================================================================
+#  video_tg — три сервиса
+#
+#   telegram-bot-api  локальный сервер Bot API, поднимает лимит отправки до 2 ГБ
+#   bot               сам бот: aiogram + vot-cli + yt-dlp + ffmpeg
+#   nginx             раздача файлов, не влезших в лимит, по прямой ссылке
+#
+#  Наружу торчит только nginx. Bot API и внутренний HTTP-эндпоинт бота
+#  доступны исключительно внутри docker-сети.
+#
+#  ПРИОРИТЕТ. Стек рассчитан на то, что сервер делится с другими сервисами
+#  (VPN, прокси, чужой бот), и обязан уступать им всё. Для этого у каждого
+#  сервиса заданы:
+#
+#    cpu_shares     — вес при дележе процессора. По умолчанию у контейнера
+#                     1024; здесь 128 и ниже, то есть примерно в восемь раз
+#                     меньше. Это ОТНОСИТЕЛЬНЫЙ вес, а не потолок: пока
+#                     остальные простаивают, бот берёт всё ядро целиком,
+#                     но отдаёт его сразу, как только другим понадобится.
+#    cpus           — жёсткий потолок. Нужен потому, что ffmpeg на одном ядре
+#                     выедает его полностью, и даже при низком весе соседи
+#                     чувствуют задержки планировщика.
+#    oom_score_adj  — кого ядро убьёт первым при нехватке памяти. У обычных
+#                     процессов 0; здесь положительные значения, поэтому под
+#                     нож пойдёт этот стек, а не VPN и не рабочий бот.
+#    mem_limit      — потолок оперативной памяти.
+#    memswap_limit  — потолок «память + swap». Разница между ним и mem_limit
+#                     это и есть разрешённый объём swap: пики уходят туда,
+#                     а не отбирают RAM у соседей.
+#    blkio_config   — вес при дележе диска (по умолчанию 500).
+#
+#  Дополнительно бот понижает приоритет своих подпроцессов изнутри через
+#  nice и ionice — см. секцию priority в config.yaml.
+#
+#  Перед первым запуском:
+#    cp .env.example .env                 и заполни его
+#    cp config.example.yaml config.yaml   и заполни его
+# =============================================================================
+
+name: video-tg
+
+services:
+
+  # ---------------------------------------------------------------------------
+  #  Локальный Telegram Bot API
+  # ---------------------------------------------------------------------------
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:10.2
+    container_name: video-tg-api
+    restart: unless-stopped
+    environment:
+      # api_id и api_hash берутся на my.telegram.org (раздел API development
+      # tools). Это НЕ токен бота — токен остаётся в config.yaml.
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID:?нужно задать TELEGRAM_API_ID в .env}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:?нужно задать TELEGRAM_API_HASH в .env}"
+      # --local: сервер работает в локальном режиме, отдаёт файлы по путям
+      # и принимает загрузки до 2 ГБ. Должно совпадать с telegram.local_mode
+      # в config.yaml.
+      TELEGRAM_LOCAL: "1"
+      TELEGRAM_VERBOSITY: "1"
+      TELEGRAM_MAX_WEBHOOK_CONNECTIONS: "10"
+    volumes:
+      # Рабочий каталог самого сервера: сюда он складывает файлы, скачанные
+      # из Telegram, и служебное состояние.
+      - tg-api-data:/var/lib/telegram-bot-api
+      # Наши готовые файлы — только на чтение. Нужно для режима
+      # telegram.use_file_uri: сервер читает MP4 прямо с диска, вместо того
+      # чтобы принимать его от бота по HTTP. Путь ОБЯЗАН совпадать с тем,
+      # который видит бот, иначе file:// не разрешится.
+      - ./data:/data:ro
+    expose:
+      - "8081"
+    networks:
+      - internal
+    # --- приоритет: ниже всех остальных сервисов машины ---
+    cpu_shares: 128
+    cpus: "0.40"
+    mem_limit: 160m
+    memswap_limit: 512m
+    oom_score_adj: 600
+    pids_limit: 128
+    blkio_config:
+      weight: 100
+    # Healthcheck здесь намеренно не задан: образ telegram-bot-api не содержит
+    # ни curl, ни wget, а проверка, которая всегда возвращает успех, хуже, чем
+    # её отсутствие — она врёт в docker compose ps. Живость Bot API видна по
+    # логам бота: если сервер недоступен, бот пишет об этом при старте.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  #  Бот
+  # ---------------------------------------------------------------------------
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # UID/GID должны совпадать с владельцем каталога ./data на хосте,
+        # иначе результаты будут недоступны для правки снаружи контейнера.
+        APP_UID: "${APP_UID:-1000}"
+        APP_GID: "${APP_GID:-1000}"
+        VOT_CLI_VERSION: "${VOT_CLI_VERSION:-2.0.1}"
+    image: video-tg-bot:latest
+    container_name: video-tg-bot
+    restart: unless-stopped
+    depends_on:
+      telegram-bot-api:
+        condition: service_started
+    environment:
+      VIDEO_TG_CONFIG: /config/config.yaml
+      # Токен бота подставляется в config.yaml через ${BOT_TOKEN}.
+      BOT_TOKEN: "${BOT_TOKEN:?нужно задать BOT_TOKEN в .env}"
+      TZ: "${TZ:-Europe/Moscow}"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./data:/data
+      # Раскомментируй, если положишь cookies.txt для YouTube:
+      # - ./data/cookies.txt:/data/cookies.txt:ro
+    expose:
+      - "8080"
+    networks:
+      - internal
+    # --- приоритет: самый низкий во всей системе ---
+    # Здесь живут ffmpeg и yt-dlp, поэтому именно этот контейнер обязан
+    # уступать сильнее прочих. Потолок 0.70 ядра оставляет запас планировщику,
+    # а разрешённый swap (1536 - 384 = 1152 МБ) принимает пики склейки,
+    # вместо того чтобы отбирать RAM у VPN и рабочего бота.
+    cpu_shares: 64
+    cpus: "0.70"
+    mem_limit: 384m
+    memswap_limit: 1536m
+    oom_score_adj: 800
+    pids_limit: 256
+    blkio_config:
+      weight: 50
+    # Ждём завершения текущей задачи при docker compose down / restart.
+    # Должно быть БОЛЬШЕ, чем queue.shutdown_grace_sec в config.yaml
+    # (по умолчанию 1800), иначе Docker прибьёт контейнер раньше срока.
+    stop_grace_period: 1860s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  #  nginx — раздача больших файлов
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.30-alpine
+    container_name: video-tg-nginx
+    restart: unless-stopped
+    depends_on:
+      - bot
+    ports:
+      # Значения по умолчанию намеренно нет: порт зависит от того, что уже
+      # занято на конкретном хосте, и должен выбираться осознанно. Compose
+      # откажется стартовать с внятным сообщением, пока HTTP_PORT не задан
+      # в .env. Он же обязан совпадать с портом в links.public_base_url.
+      - "${HTTP_PORT:?задай HTTP_PORT в .env — свободный порт для раздачи файлов}:80"
+      # Для HTTPS: раскомментируй строку ниже и блок server в nginx.conf,
+      # затем положи сертификаты в ./nginx/certs.
+      # - "${HTTPS_PORT}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Только каталог с выложенными файлами и только на чтение.
+      - ./data/files:/srv/files:ro
+      # - ./nginx/certs:/etc/nginx/certs:ro
+    networks:
+      - internal
+    # --- приоритет: ниже остальных сервисов машины ---
+    # nginx только отдаёт файлы, много ему не нужно.
+    cpu_shares: 128
+    cpus: "0.30"
+    mem_limit: 48m
+    memswap_limit: 128m
+    oom_score_adj: 500
+    pids_limit: 64
+    blkio_config:
+      weight: 100
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/nginx-health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  tg-api-data:
