@@ -118,6 +118,11 @@ fi
 
 # --- Сборка --------------------------------------------------------------------------
 if [ "${NEEDS_EDIT}" -eq 1 ]; then
+    say "Порты, занятые прямо сейчас (выбирай HTTP_PORT из свободных)"
+    ss -tuln 2>/dev/null | awk 'NR>1 {print $5}' | grep -oE '[0-9]+$' \
+        | sort -un | tr '\n' ' ' | sed 's/^/    занято: /'
+    echo
+
     cat <<'EOF'
 
 ────────────────────────────────────────────────────────────────────────
@@ -127,10 +132,16 @@ if [ "${NEEDS_EDIT}" -eq 1 ]; then
        BOT_TOKEN          — токен от @BotFather
        TELEGRAM_API_ID    — с https://my.telegram.org → API development tools
        TELEGRAM_API_HASH  — оттуда же
+       HTTP_PORT          — свободный порт для раздачи больших файлов
+                            (значения по умолчанию нет: на занятом сервере
+                             порт 80 обычно уже кем-то используется)
 
   2) config.yaml
        telegram.allowed_user_ids  — твой user_id (узнать: @userinfobot)
-       links.public_base_url      — http://<домен или IP этого сервера>
+       links.public_base_url      — http://<адрес сервера>:<тот же HTTP_PORT>
+
+  3) Открыть выбранный порт в файрволе:
+       sudo ufw allow <HTTP_PORT>/tcp
 
   Затем:
        docker compose build
@@ -140,6 +151,49 @@ if [ "${NEEDS_EDIT}" -eq 1 ]; then
 
 EOF
     exit 0
+fi
+
+# --- Проверка, что обязательные переменные заполнены ---------------------------
+missing=""
+for var in BOT_TOKEN TELEGRAM_API_ID TELEGRAM_API_HASH HTTP_PORT; do
+    value="$(grep -E "^${var}=" .env 2>/dev/null | head -1 | cut -d= -f2-)"
+    case "${value}" in
+        ""|123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|1234567|0123456789abcdef0123456789abcdef)
+            missing="${missing} ${var}" ;;
+    esac
+done
+
+if [ -n "${missing}" ]; then
+    die "в .env не заполнено:${missing}
+     Открой .env, подставь значения и запусти скрипт снова."
+fi
+ok ".env заполнен"
+
+HTTP_PORT_VALUE="$(grep -E '^HTTP_PORT=' .env | head -1 | cut -d= -f2-)"
+if ss -tuln 2>/dev/null | grep -qE ":${HTTP_PORT_VALUE}\b"; then
+    die "порт ${HTTP_PORT_VALUE} уже занят другим сервисом.
+     Посмотри свободные (ss -tuln), выбери другой и поправь HTTP_PORT в .env
+     и links.public_base_url в config.yaml."
+fi
+ok "порт ${HTTP_PORT_VALUE} свободен"
+
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    if ufw status 2>/dev/null | grep -qE "^${HTTP_PORT_VALUE}[/ ]"; then
+        ok "порт ${HTTP_PORT_VALUE} открыт в ufw"
+    else
+        warn "порт ${HTTP_PORT_VALUE} НЕ открыт в ufw — ссылки на большие файлы"
+        warn "не будут работать снаружи. Открыть: sudo ufw allow ${HTTP_PORT_VALUE}/tcp"
+    fi
+fi
+
+# --- Swap: без него сборка на слабой машине может упасть -------------------------
+total_ram_mb="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
+swap_mb="$(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo)"
+if [ "${total_ram_mb}" -lt 2048 ] && [ "${swap_mb}" -lt 512 ]; then
+    warn "RAM ${total_ram_mb} МБ, swap ${swap_mb} МБ — сборка образа может упасть по нехватке памяти."
+    warn "Настоятельно рекомендую добавить swap:"
+    warn "  fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile \\"
+    warn "    && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab"
 fi
 
 say "Собираю образ (первый раз это 3–7 минут)"
