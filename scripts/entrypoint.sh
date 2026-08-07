@@ -12,7 +12,8 @@
 
 set -euo pipefail
 
-APP_USER="${APP_USER:-botuser}"
+APP_UID="${APP_UID:-1000}"
+APP_GID="${APP_GID:-1000}"
 DATA_DIR="${DATA_DIR:-/data}"
 CONFIG_FILE="${VIDEO_TG_CONFIG:-/config/config.yaml}"
 
@@ -37,15 +38,13 @@ mkdir -p \
     "${DATA_DIR}/logs"
 
 if [ "$(id -u)" = "0" ]; then
-    target_uid="$(id -u "${APP_USER}")"
-    target_gid="$(id -g "${APP_USER}")"
     current_uid="$(stat -c '%u' "${DATA_DIR}")"
 
-    if [ "${current_uid}" != "${target_uid}" ]; then
-        log "выставляю владельца ${DATA_DIR} → ${APP_USER} (${target_uid}:${target_gid})"
+    if [ "${current_uid}" != "${APP_UID}" ]; then
+        log "выставляю владельца ${DATA_DIR} → ${APP_UID}:${APP_GID}"
         # -R по большому кэшу может занять время, поэтому только при
         # несовпадении владельца верхнего каталога.
-        chown -R "${target_uid}:${target_gid}" "${DATA_DIR}" || \
+        chown -R "${APP_UID}:${APP_GID}" "${DATA_DIR}" || \
             log "ВНИМАНИЕ: chown не удался полностью, продолжаю"
     fi
 
@@ -53,8 +52,19 @@ if [ "$(id -u)" = "0" ]; then
     # которые монтируют /data только на чтение и работают под своими UID.
     umask 0022
 
-    log "запускаю от пользователя ${APP_USER}: $*"
-    exec gosu "${APP_USER}" "$@"
+    if [ "${APP_UID}" = "0" ]; then
+        # Запуск от root — не то, чего мы хотим, но это осознанный выбор
+        # того, кто выставил APP_UID=0. Работаем, но говорим об этом.
+        log "ВНИМАНИЕ: APP_UID=0, бот будет работать от root."
+        log "Безопаснее указать в .env непривилегированный UID, например 1000."
+        log "запускаю: $*"
+        exec "$@"
+    fi
+
+    # gosu по числовому UID:GID — имя пользователя может и не существовать,
+    # если этот UID уже был занят системным пользователем образа.
+    log "запускаю от ${APP_UID}:${APP_GID}: $*"
+    exec gosu "${APP_UID}:${APP_GID}" "$@"
 fi
 
 log "запускаю: $*"

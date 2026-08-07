@@ -74,8 +74,25 @@ RUN pip install --no-cache-dir -r requirements.txt \
 # --- Пользователь ---------------------------------------------------------------
 # Бот работает не от root. UID/GID совпадают с владельцем ./data на хосте,
 # иначе результаты сборки окажутся недоступны для правки снаружи.
-RUN groupadd --gid "${APP_GID}" botuser \
- && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /bin/bash botuser
+#
+# Создание идёт «мягко»: если такой UID или GID в образе уже занят системным
+# пользователем, ничего не пересоздаём. Иначе сборка падала бы, например, на
+# APP_UID=0 — а его легко получить, просто запустив установку от root.
+# Дальше в entrypoint gosu вызывается по числовому UID:GID, поэтому имя
+# пользователя роли не играет.
+RUN set -eux; \
+    if ! getent group "${APP_GID}" >/dev/null 2>&1; then \
+        groupadd --gid "${APP_GID}" botuser; \
+    fi; \
+    if ! getent passwd "${APP_UID}" >/dev/null 2>&1; then \
+        useradd --uid "${APP_UID}" --gid "${APP_GID}" \
+                --create-home --shell /bin/bash botuser; \
+    fi; \
+    getent passwd "${APP_UID}"
+
+# Entrypoint читает их из окружения, чтобы сбросить привилегии по числам.
+ENV APP_UID=${APP_UID} \
+    APP_GID=${APP_GID}
 
 # --- Код ------------------------------------------------------------------------
 COPY app/ ./app/

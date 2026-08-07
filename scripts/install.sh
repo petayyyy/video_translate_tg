@@ -26,6 +26,18 @@ TARGET_USER="${SUDO_USER:-${USER}}"
 TARGET_UID="$(id -u "${TARGET_USER}")"
 TARGET_GID="$(id -g "${TARGET_USER}")"
 
+# Владельцем данных не должен становиться root: контейнер тогда работал бы
+# от root, а сборка образа падала бы на попытке создать группу с GID 0,
+# которая уже существует. Подставляем непривилегированный UID.
+UNPRIVILEGED_UID=1000
+UNPRIVILEGED_GID=1000
+RAN_AS_ROOT=0
+if [ "${TARGET_UID}" -eq 0 ]; then
+    RAN_AS_ROOT=1
+    TARGET_UID="${UNPRIVILEGED_UID}"
+    TARGET_GID="${UNPRIVILEGED_GID}"
+fi
+
 BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; OFF='\033[0m'
 
 say()  { printf "${BOLD}==>${OFF} %s\n" "$*"; }
@@ -43,7 +55,15 @@ if [ ! -f docker-compose.yml ]; then
 fi
 
 say "Проект: ${PROJECT_DIR}"
-say "Владелец данных: ${TARGET_USER} (${TARGET_UID}:${TARGET_GID})"
+if [ "${RAN_AS_ROOT}" -eq 1 ]; then
+    say "Владелец данных: ${TARGET_UID}:${TARGET_GID} (непривилегированный)"
+    warn "Скрипт запущен от root напрямую. Данные и контейнер намеренно"
+    warn "переводятся на UID ${TARGET_UID}: контейнер не должен работать от root,"
+    warn "а сборка образа с APP_UID=0 упала бы на создании группы."
+    warn "Root на хосте по-прежнему имеет полный доступ к ./data."
+else
+    say "Владелец данных: ${TARGET_USER} (${TARGET_UID}:${TARGET_GID})"
+fi
 
 # --- Docker ------------------------------------------------------------------
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
