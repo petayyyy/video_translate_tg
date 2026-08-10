@@ -13,6 +13,7 @@ FROM python:3.12-slim-bookworm
 # остальной Dockerfile (docker compose build --build-arg VOT_CLI_VERSION=2.1.0).
 ARG NODE_MAJOR=22
 ARG VOT_CLI_VERSION=2.0.1
+ARG VOT_CLI_LIVE_VERSION=1.7.5
 ARG APP_UID=1000
 ARG APP_GID=1000
 
@@ -60,10 +61,22 @@ RUN set -eux; \
     npm --version
 
 # --- vot-cli ------------------------------------------------------------------
-# Ставим точную версию: «latest» через полгода означает другую утилиту.
-RUN npm install -g "vot-cli@${VOT_CLI_VERSION}" \
+# Ставим ОБЕ реализации, точными версиями: «latest» через полгода означает
+# другую утилиту. Переключение между ними — правка vot.flavor в config.yaml,
+# без пересборки образа.
+#
+#   vot-cli       FOSWLY, основная. Работает через промежуточный бэкенд
+#                 проекта; если тот недоступен, перевод не запускается вовсе.
+#   vot-cli-live  форк fantomcheg. Не зависит от @vot.js и обращается к
+#                 Яндексу напрямую, поэтому переживает падение чужого
+#                 бэкенда. Держим как рабочий запасной вариант.
+#
+# Лишние ~15 МБ в образе стоят того, чтобы в момент отказа одной реализации
+# переключение занимало одну строку в конфиге, а не пересборку на сервере.
+RUN npm install -g "vot-cli@${VOT_CLI_VERSION}" "vot-cli-live@${VOT_CLI_LIVE_VERSION}" \
  && npm cache clean --force \
- && vot-cli --version
+ && vot-cli --version \
+ && vot-cli-live --version 2>/dev/null || true
 
 # --- Python-зависимости --------------------------------------------------------
 WORKDIR /opt/video_tg

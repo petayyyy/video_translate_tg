@@ -240,6 +240,21 @@ class VotSettings(_Base):
     extra_args: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
+    def _resolve_binary(self) -> "VotSettings":
+        """Подставляет исполняемый файл, соответствующий выбранной реализации.
+
+        Иначе смена одного только ``flavor: live`` приводила бы к запуску
+        всё того же ``vot-cli`` с флагами форка — отказ был бы невнятным.
+        Явно указанный ``binary`` не трогаем.
+
+        Запись идёт мимо валидации намеренно: при ``validate_assignment=True``
+        обычное присваивание внутри mode="after" запустило бы проверку заново.
+        """
+        if self.flavor == "live" and self.binary == "vot-cli":
+            self.__dict__["binary"] = "vot-cli-live"
+        return self
+
+    @model_validator(mode="after")
     def _check_budget(self) -> "VotSettings":
         if self.total_timeout_sec < self.attempt_timeout_sec:
             raise ValueError(
