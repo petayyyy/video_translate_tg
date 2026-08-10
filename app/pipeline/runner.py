@@ -130,6 +130,9 @@ class PipelineRunner:
             ref,
             workdir,
             source_lang=meta.language,
+            # По длительности ролика отличаем готовую дорожку от заглушки,
+            # которую бэкенд отдаёт вместе с «успехом», пока перевод делается.
+            expected_duration_sec=meta.duration_sec,
             cancel_event=cancel_event,
             progress=_vot_progress,
         )

@@ -142,15 +142,22 @@ class VotClient:
         workdir: Path,
         *,
         source_lang: str | None = None,
+        expected_duration_sec: float | None = None,
         cancel_event: asyncio.Event | None = None,
         progress: ProgressCallback = None,
     ) -> VotArtifact:
-        """Получает русскую звуковую дорожку. Файл кладётся в ``workdir``."""
+        """Получает русскую звуковую дорожку. Файл кладётся в ``workdir``.
+
+        :param expected_duration_sec: длительность ролика. Используется, чтобы
+            отличить готовую дорожку от заглушки, которую бэкенд отдаёт, пока
+            перевод ещё делается.
+        """
         return await self._obtain(
             ref,
             workdir,
             kind="audio",
             source_lang=source_lang,
+            expected_duration_sec=expected_duration_sec,
             cancel_event=cancel_event,
             progress=progress,
         )
@@ -170,6 +177,7 @@ class VotClient:
             workdir,
             kind="subtitles",
             source_lang=source_lang,
+            expected_duration_sec=None,
             cancel_event=cancel_event,
             progress=progress,
         )
@@ -265,6 +273,7 @@ class VotClient:
         *,
         kind: str,
         source_lang: str | None,
+        expected_duration_sec: float | None,
         cancel_event: asyncio.Event | None,
         progress: ProgressCallback,
     ) -> VotArtifact:
@@ -320,6 +329,7 @@ class VotClient:
             )
 
             pending_reason = "перевод ещё готовится"
+            artifact_rejected = False
             result: ProcResult | None = None
 
             try:
@@ -355,32 +365,60 @@ class VotClient:
                     progress=progress,
                 )
                 if artifact is not None:
-                    waited = time.monotonic() - started
-                    log.info(
-                        "vot_done",
-                        kind=kind,
-                        attempts=attempt,
-                        waited_sec=round(waited, 1),
-                        size=artifact.stat().st_size,
-                    )
-                    return VotArtifact(
-                        path=artifact,
-                        kind=kind,
-                        source_lang=resolved_lang,
-                        lively_voice=settings.lively_voice,
-                        attempts=attempt,
-                        waited_sec=waited,
-                    )
+                    # Бэкенд отвечает «успех» и отдаёт ссылку раньше, чем
+                    # перевод реально готов — по ней в этот момент лежит
+                    # заглушка. Без этой проверки она уезжала в ffmpeg и
+                    # роняла склейку с «Header missing», а настоящая причина
+                    # («подожди ещё») терялась. Забраковали — значит не готово.
+                    if kind == "subtitles":
+                        problem = _validate_subtitles(artifact)
+                    else:
+                        problem = _validate_audio(artifact, expected_duration_sec)
+
+                    if problem is not None:
+                        log.info(
+                            "vot_artifact_not_ready",
+                            attempt=attempt,
+                            kind=kind,
+                            reason=problem,
+                            size=artifact.stat().st_size if artifact.exists() else 0,
+                        )
+                        artifact.unlink(missing_ok=True)
+                        pending_reason = "перевод ещё готовится"
+                        artifact_rejected = True
+                    else:
+                        waited = time.monotonic() - started
+                        log.info(
+                            "vot_done",
+                            kind=kind,
+                            attempts=attempt,
+                            waited_sec=round(waited, 1),
+                            size=artifact.stat().st_size,
+                        )
+                        return VotArtifact(
+                            path=artifact,
+                            kind=kind,
+                            source_lang=resolved_lang,
+                            lively_voice=settings.lively_voice,
+                            attempts=attempt,
+                            waited_sec=waited,
+                        )
 
                 # Результата нет. Разбираемся: ждать или падать.
-                fatal = classify_vot_output(combined)
+                # Забракованный артефакт разбору не подлежит: бэкенд в этом
+                # случае отрапортовал успех, и в выводе нет ничего, что
+                # стоило бы классифицировать как ошибку.
+                fatal = None if artifact_rejected else classify_vot_output(combined)
                 if fatal is not None and not looks_like_translation_pending(combined):
                     if kind == "subtitles" and isinstance(fatal, SubtitlesUnavailable):
                         raise fatal
                     log.info("vot_fatal", kind=kind, error=type(fatal).__name__)
                     raise fatal
 
-                pending = looks_like_translation_pending(combined)
+                # Недоделанная дорожка — это именно «ещё готовится», поэтому
+                # она не должна попадать в счётчик глухих отказов: иначе бот
+                # сдался бы через несколько попыток, не дождавшись перевода.
+                pending = artifact_rejected or looks_like_translation_pending(combined)
 
                 # Без этой строки диагностировать отказ невозможно: в логе
                 # оставалась только строка vot_attempt без единого намёка,
@@ -633,6 +671,68 @@ def _first_url(candidates: Iterable[str]) -> str | None:
         if candidate.lower().startswith(("http://", "https://")):
             return candidate
     return None
+
+
+#: Сигнатуры начала MP3: тег ID3 либо синхрослово кадра (11 единичных бит).
+_MP3_MAGIC: tuple[bytes, ...] = (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2", b"\xff\xfa")
+
+#: Минимальный правдоподобный битрейт речевой дорожки, байт в секунду.
+#: Яндекс отдаёт около 16 кБ/с; порог занижен втрое с запасом, чтобы ловить
+#: только явные подделки, а не законно тихие или сильно сжатые дорожки.
+_MIN_AUDIO_BYTES_PER_SEC = 700
+
+
+def _validate_audio(path: Path, expected_duration_sec: float | None) -> str | None:
+    """Проверяет, что файл действительно похож на звуковую дорожку.
+
+    Нужно, потому что бэкенд отвечает «успех» и отдаёт ссылку ещё до того,
+    как перевод фактически готов: по ссылке в этот момент лежит заглушка.
+    Без проверки она уезжала в ffmpeg и роняла склейку с невнятным
+    «Header missing», хотя настоящая причина — «подожди ещё немного».
+
+    :returns: причину отбраковки или None, если файл выглядит правдоподобно.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"файл недоступен: {exc}"
+
+    if size < 4096:
+        return f"слишком маленький файл ({size} Б)"
+
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(4)
+    except OSError as exc:
+        return f"не удалось прочитать: {exc}"
+
+    if not any(head.startswith(magic) for magic in _MP3_MAGIC):
+        # Заглушки и страницы ошибок начинаются с '<', '{' и подобного.
+        return f"это не MP3 (первые байты: {head!r})"
+
+    if expected_duration_sec and expected_duration_sec > 0:
+        minimum = int(expected_duration_sec * _MIN_AUDIO_BYTES_PER_SEC)
+        if size < minimum:
+            return (
+                f"дорожка короче ожидаемого: {size / 1024**2:.2f} МБ при "
+                f"минимуме {minimum / 1024**2:.2f} МБ на "
+                f"{expected_duration_sec / 60:.0f} мин видео"
+            )
+    return None
+
+
+def _validate_subtitles(path: Path) -> str | None:
+    """Беглая проверка субтитров: в SRT и VTT обязана быть стрелка тайминга."""
+    try:
+        if path.stat().st_size < 16:
+            return "пустой файл субтитров"
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            head = handle.read(4096)
+    except OSError as exc:
+        return f"не удалось прочитать: {exc}"
+    if path.suffix.lower() == ".json":
+        return None if head.lstrip().startswith(("{", "[")) else "это не JSON"
+    return None if "-->" in head else "в файле нет таймингов субтитров"
 
 
 def _clear_directory(directory: Path) -> None:
