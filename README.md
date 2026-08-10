@@ -752,6 +752,37 @@ docker compose logs telegram-bot-api | tail -30
 
 ### Ошибки при обработке
 
+**«Яндекс отказал в переводе на этапе создания сессии».**
+В логе vot-cli это выглядит как `Failed to request create session`, причём
+`Getting video data` при этом проходит успешно. Проверь, повторяется ли отказ
+на заведомо переведённом ролике:
+
+```bash
+docker compose exec bot vot-cli --lang=en --reslang=ru --preview "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+Если отказ приходит и здесь — дело не в видео, а в адресе сервера: Яндекс
+блокирует диапазоны хостингов. Лечится прокси:
+
+```yaml
+vot:
+  proxy: "http://user:pass@адрес:порт"
+```
+
+Подойдёт любой HTTP или SOCKS-прокси, лучше всего с российским адресом.
+Проверить конкретный прокси до правки конфига:
+
+```bash
+docker compose exec bot vot-cli --proxy="http://адрес:порт" --lang=en --reslang=ru --preview "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+Тот же ролик стоит проверить с домашнего компьютера — если там переводится,
+а на сервере нет, это окончательно подтверждает блокировку по адресу:
+
+```bash
+npx vot-cli@2.0.1 --lang=en --reslang=ru --preview "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
 **«Яндекс не смог перевести этот ролик».**
 Штатная ситуация: в видео нет речи, язык оригинала не поддерживается,
 либо ролик слишком длинный для их бэкенда. Проверить, дело ли в боте:

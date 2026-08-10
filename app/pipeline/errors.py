@@ -23,6 +23,7 @@ __all__ = [
     "VideoTooLong",
     "VideoTooBig",
     "TranslationUnavailable",
+    "TranslationBackendRefused",
     "TranslationTimeout",
     "SubtitlesUnavailable",
     "DownloadFailed",
@@ -109,6 +110,25 @@ class TranslationUnavailable(PipelineError):
         "Яндекс не смог перевести этот ролик.\n"
         "Чаще всего так бывает, если в видео нет речи, язык оригинала "
         "не поддерживается, или ролик слишком длинный для их бэкенда."
+    )
+
+
+class TranslationBackendRefused(PipelineError):
+    """Бэкенд Яндекса не дал создать сессию перевода.
+
+    Отличается от TranslationUnavailable тем, что дело не в ролике: отказ
+    приходит на любое видео, включая заведомо переведённые. Практически
+    всегда это блокировка адреса сервера — Яндекс режет диапазоны хостингов.
+    """
+
+    retriable = True
+    user_message = (
+        "Яндекс отказал в переводе на этапе создания сессии.\n\n"
+        "Если это повторяется для любых роликов, дело не в видео, а в адресе "
+        "сервера: Яндекс блокирует диапазоны хостингов.\n\n"
+        "Что делать: прописать прокси в параметре vot.proxy — подойдёт любой "
+        "HTTP/SOCKS-прокси, лучше всего с российским адресом.\n"
+        "Подробнее — раздел «Диагностика» в README."
     )
 
 
@@ -235,6 +255,13 @@ _VOT_PENDING = re.compile(
 )
 
 _VOT_RULES = _rules(
+    # Отказ бэкенда на этапе создания сессии. Проверяется первым: он приходит
+    # на любое видео, поэтому не должен быть спутан с «нет перевода для этого
+    # ролика» — совет пользователю в этих случаях совершенно разный.
+    (r"failed\s+to\s+request\s+create\s+session", TranslationBackendRefused),
+    (r"failed\s+to\s+create\s+session", TranslationBackendRefused),
+    (r"create\s+session.{0,20}(?:failed|error|refused)", TranslationBackendRefused),
+    (r"(?:session|сесси).{0,30}(?:refused|denied|blocked|запрещ|отказ)", TranslationBackendRefused),
     (r"(?:unsupported|not\s+supported).{0,40}(?:site|platform|host|url)", UnsupportedPlatform),
     (r"(?:can'?t|cannot|unable to)\s+(?:find|detect)\s+(?:video|service)", UnsupportedPlatform),
     (r"video\s+(?:is\s+)?(?:unavailable|not\s+found|private|deleted)", VideoUnavailable),

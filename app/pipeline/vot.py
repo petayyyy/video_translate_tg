@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import shutil
@@ -76,6 +77,18 @@ _URL_KEYS = ("url", "audiourl", "downloadurl", "link", "translationurl", "result
 _PATH_KEYS = ("outputpath", "output", "path", "file", "filepath", "outfile")
 
 _HTTP_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+#: Сколько попыток подряд без признаков «ещё готовится» считать отказом.
+#: Считаются только неудачи после того, как исчерпаны запасные пути.
+_MAX_HARD_FAILURES = 4
+
+
+def _short(text: str, limit: int = 300) -> str:
+    """Обрезает вывод утилиты для показа пользователю в сообщении."""
+    cleaned = " ".join(text.split())
+    if len(cleaned) > limit:
+        cleaned = cleaned[-limit:]
+    return html.escape(cleaned, quote=False)
 
 
 @dataclass(slots=True)
@@ -174,11 +187,15 @@ class VotClient:
         configured = (self._settings.source_lang or "auto").strip().lower()
         if configured != "auto":
             return configured
-        if not self._settings.lively_voice:
-            return "auto"
+        # Определённый yt-dlp язык предпочитается всегда, а не только при
+        # живых голосах: "auto" бэкенд Яндекса принимает не во всех режимах,
+        # а реальный код языка — всегда. Хвост локали отбрасывается:
+        # yt-dlp отдаёт "en-US", vot-cli ждёт "en".
         if hint:
-            return hint.split("-")[0].lower()
-        return self._settings.source_lang_fallback
+            return hint.split("-")[0].strip().lower()
+        if self._settings.lively_voice:
+            return self._settings.source_lang_fallback
+        return "auto"
 
     def _build_command(
         self,
@@ -193,7 +210,12 @@ class VotClient:
         command: list[str] = [settings.binary, "--json"]
 
         if settings.flavor == "foswly":
-            command.append("--no-visual")
+            # --no-visual намеренно НЕ передаётся. С ним vot-cli печатает
+            # только JSON вида {"ok":false,...}, в котором нет ни слова о
+            # причине отказа, и диагностировать нечего. Без него рядом с JSON
+            # остаётся читаемая строка («Failed to request create session»),
+            # по которой ошибка распознаётся и превращается во внятный совет.
+            # Разбор JSON из окружающего шума реализован в _extract_json.
             command.append(f"--lang={source_lang}")
             command.append(f"--reslang={settings.target_lang}")
             if settings.lively_voice:
@@ -265,7 +287,7 @@ class VotClient:
         )
 
         attempt = 0
-        preview_failures = 0
+        hard_failures = 0
 
         while True:
             attempt += 1
@@ -358,19 +380,62 @@ class VotClient:
                     log.info("vot_fatal", kind=kind, error=type(fatal).__name__)
                     raise fatal
 
-                if not looks_like_translation_pending(combined) and result.ok and use_preview:
-                    # Процесс отработал успешно, но ссылку разобрать не вышло.
-                    # Скорее всего --preview в этой версии не отдаёт то, что мы
-                    # ждём, — переключаемся на путь со скачиванием в файл.
-                    preview_failures += 1
-                    if preview_failures >= 2:
+                pending = looks_like_translation_pending(combined)
+
+                # Без этой строки диагностировать отказ невозможно: в логе
+                # оставалась только строка vot_attempt без единого намёка,
+                # почему попытка ничего не дала.
+                log.info(
+                    "vot_no_result",
+                    attempt=attempt,
+                    kind=kind,
+                    rc=result.returncode,
+                    pending=pending,
+                    output=combined[-500:].strip() or "<пусто>",
+                )
+
+                if not pending:
+                    hard_failures += 1
+
+                    # Код возврата у vot-cli недостоверен: при явном отказе он
+                    # отдаёт 0 в терминале и может отдать 1 без TTY. Поэтому
+                    # переключение на запасной путь НЕ завязано на result.ok —
+                    # раньше именно из-за этого фолбэк молча не срабатывал.
+                    if use_preview and hard_failures >= 2:
                         log.warning(
                             "vot_preview_unusable",
                             hint="переключаюсь на режим скачивания файла",
                             output=combined[-400:],
                         )
                         use_preview = False
+                        hard_failures = 0
                         continue
+
+                    # Запасной путь уже испробован и тоже не помог. Крутиться
+                    # до общего таймаута бессмысленно — это не «ещё не готово»,
+                    # а устойчивый отказ. Сдаёмся и показываем, что ответила
+                    # утилита, вместо часа тишины.
+                    if hard_failures >= _MAX_HARD_FAILURES:
+                        log.error(
+                            "vot_giving_up",
+                            attempts=attempt,
+                            hard_failures=hard_failures,
+                            output=combined[-800:],
+                        )
+                        raise TranslationUnavailable(
+                            combined[-800:],
+                            user_message=(
+                                "Яндекс отказался переводить этот ролик — "
+                                f"{hard_failures} попыток подряд без результата.\n\n"
+                                "Ответ утилиты:\n"
+                                f"<code>{_short(combined)}</code>\n\n"
+                                "Если то же самое повторяется на любых роликах, "
+                                "проблема не в видео, а в доступе к бэкенду Яндекса — "
+                                "см. раздел «Диагностика» в README."
+                            ),
+                        )
+                else:
+                    hard_failures = 0
 
             # Перевод ещё не готов — ждём с backoff.
             if schedule.exhausted:
