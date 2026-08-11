@@ -225,6 +225,7 @@ class VotSettings(_Base):
     source_lang_fallback: str = "en"
     target_lang: str = "ru"
     lively_voice: bool = False
+    force_live_voices: bool = False
     api_token: str = ""
     proxy: str = ""
     vot_host: str = ""

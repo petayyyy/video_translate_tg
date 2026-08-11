@@ -1,26 +1,18 @@
-"""Обёртка над vot-cli: получение русской дорожки и субтитров от Яндекса.
+"""Обёртка над vot-cli-live (fantomcheg): получение русской дорожки и субтитров от Яндекса.
 
-Ключевая сложность здесь — асинхронность бэкенда Яндекса. На первый запрос
-он отвечает не переводом, а «перевод готовится, зайди через N секунд».
-Сам vot-cli это частично прячет (внутри у него рекурсивный опрос раз в 30 с),
-но делает это без ограничения по времени и без обратной связи наружу.
+Используется только форк fantomcheg/vot-cli-live 1.7.5. Оригинальный
+foswly/vot-cli 2.0.1 неработоспособен: его промежуточный бэкенд на
+vot.toil.cc больше не резолвится.
 
-Поэтому опрос вынесен на уровень бота:
-
-* каждая попытка запускается со своим таймаутом ``vot.attempt_timeout_sec``;
-  по его истечении процесс убивается вместе с группой;
-* таймаут попытки трактуется как «перевод ещё не готов», а не как ошибка —
-  ровно так же, как явное сообщение бэкенда об ожидании;
-* между попытками — экспоненциальная задержка с джиттером, а не фиксированный
-  ``sleep``; общий бюджет ограничен ``vot.total_timeout_sec``;
-* состояние перевода Яндекс держит у себя и привязывает к ссылке на ролик,
-  поэтому убитая на середине попытка ничего не теряет: следующая подхватывает
-  ту же задачу, а не начинает заново.
-
-Разбор вывода намеренно терпимый. Формат JSON у vot-cli между версиями менялся,
-поэтому вместо жёсткой схемы используется рекурсивный поиск полей со ссылкой
-или путём к файлу, а если JSON не разобрался вообще — включается запасной путь
-со скачиванием файла самим vot-cli и поиском результата в рабочем каталоге.
+Ключевые наблюдаемые свойства форка:
+* Вывод --json — МАССИВ объектов [{url, platform, videoTitle, success, audioUrl, error, voiceType}].
+* В режиме субтитров перед основным JSON печатается строка «Subtitles response (URL): <JSON>».
+* Код возврата всегда 0, даже при явном отказе. На него нельзя полагаться.
+* Для закешированных роликов ответ приходит мгновенно с валидной дорожкой.
+* Для незакешированных — success:true и audioUrl отдаются ДО готовности перевода,
+  по ссылке лежит заглушка. Её нужно опознать через ffprobe и отправиться на повторный опрос.
+* Яндекс переводит асинхронно: первый запрос запускает перевод, готовность — через минуты.
+  Нужен опрос с экспоненциальной задержкой, а не фиксированный sleep.
 """
 
 from __future__ import annotations
@@ -33,7 +25,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -42,12 +34,9 @@ from app.logging_setup import get_logger
 from app.pipeline.errors import (
     DownloadFailed,
     JobCancelled,
-    SubtitlesUnavailable,
     ToolMissing,
     TranslationTimeout,
     TranslationUnavailable,
-    classify_vot_output,
-    looks_like_translation_pending,
 )
 from app.utils.proc import (
     ProcCancelled,
@@ -58,7 +47,7 @@ from app.utils.proc import (
     format_command,
     run_process,
 )
-from app.utils.retry import BackoffSchedule, CancelledByUser, retry_async, sleep_with_cancel
+from app.utils.retry import BackoffSchedule, CancelledByUser, sleep_with_cancel
 from app.utils.urls import VideoRef
 
 __all__ = ["VotClient", "VotArtifact"]
@@ -67,24 +56,34 @@ log = get_logger(__name__)
 
 ProgressCallback = Callable[[str], Awaitable[None]] | None
 
-#: Расширения, которые может отдать vot-cli. Порядок — приоритет при поиске.
 _AUDIO_SUFFIXES = (".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav")
 _SUBS_SUFFIXES = (".srt", ".vtt", ".json")
 
-#: Поля JSON, в которых может лежать прямая ссылка на результат.
-_URL_KEYS = ("url", "audiourl", "downloadurl", "link", "translationurl", "result")
-#: Поля JSON, в которых может лежать путь к уже скачанному файлу.
-_PATH_KEYS = ("outputpath", "output", "path", "file", "filepath", "outfile")
+# Ошибки, которые означают «это видео нельзя перевести» — повторять бессмысленно.
+_FATAL_ERROR_PATTERNS = (
+    re.compile(r"translation\s+(?:is\s+)?not\s+available\s+for\s+this\s+video", re.IGNORECASE),
+    re.compile(r"unsupported\s+(?:site|platform|url)", re.IGNORECASE),
+    re.compile(r"video\s+(?:is\s+)?(?:unavailable|not\s+found|private|deleted)", re.IGNORECASE),
+    re.compile(r"no\s+(?:subtitles|субтитр)", re.IGNORECASE),
+)
 
-_HTTP_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+# Ошибки, которые означают «сеть/сервер временно недоступен» — надо повторить.
+_RETRYABLE_ERROR_PATTERNS = (
+    re.compile(r"timed\s*out|etimedout|econnrefused|econnreset|enotfound|eai_again", re.IGNORECASE),
+    re.compile(r"failed\s+to\s+(?:request|create)\s+session", re.IGNORECASE),
+    re.compile(r"(?:network|connection)\s+(?:error|refused|reset)", re.IGNORECASE),
+    re.compile(r"(?:5\d\d|server\s+error)", re.IGNORECASE),
+)
 
-#: Сколько попыток подряд без признаков «ещё готовится» считать отказом.
-#: Считаются только неудачи после того, как исчерпаны запасные пути.
+# Максимальное число устойчивых отказов подряд, после которых сдаёмся.
 _MAX_HARD_FAILURES = 4
+
+# Допустимое расхождение длительностей: дорожка от Яндекса может быть на 20%
+# короче или длиннее оригинала (реклама, заставки, отличия в темпе речи).
+_DURATION_TOLERANCE = 0.25
 
 
 def _short(text: str, limit: int = 300) -> str:
-    """Обрезает вывод утилиты для показа пользователю в сообщении."""
     cleaned = " ".join(text.split())
     if len(cleaned) > limit:
         cleaned = cleaned[-limit:]
@@ -93,7 +92,7 @@ def _short(text: str, limit: int = 300) -> str:
 
 @dataclass(slots=True)
 class VotArtifact:
-    """Результат работы vot-cli: файл на диске плюс диагностика."""
+    """Результат работы vot-cli-live: файл на диске плюс диагностика."""
 
     path: Path
     kind: str  # "audio" | "subtitles"
@@ -111,9 +110,9 @@ class VotArtifact:
 
 
 class VotClient:
-    """Запуск vot-cli с корректным опросом статуса перевода."""
+    """Запуск vot-cli-live с опросом до фактической готовности перевода."""
 
-    __slots__ = ("_settings", "_http", "_owns_http", "_priority")
+    __slots__ = ("_settings", "_http", "_owns_http", "_priority", "_binary")
 
     def __init__(
         self,
@@ -129,6 +128,7 @@ class VotClient:
             timeout=httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=30.0),
             headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) video_tg/1.0"},
         )
+        self._binary = settings.binary
 
     async def aclose(self) -> None:
         if self._owns_http:
@@ -146,12 +146,6 @@ class VotClient:
         cancel_event: asyncio.Event | None = None,
         progress: ProgressCallback = None,
     ) -> VotArtifact:
-        """Получает русскую звуковую дорожку. Файл кладётся в ``workdir``.
-
-        :param expected_duration_sec: длительность ролика. Используется, чтобы
-            отличить готовую дорожку от заглушки, которую бэкенд отдаёт, пока
-            перевод ещё делается.
-        """
         return await self._obtain(
             ref,
             workdir,
@@ -171,7 +165,6 @@ class VotClient:
         cancel_event: asyncio.Event | None = None,
         progress: ProgressCallback = None,
     ) -> VotArtifact:
-        """Получает субтитры в формате из конфига (по умолчанию SRT)."""
         return await self._obtain(
             ref,
             workdir,
@@ -185,25 +178,12 @@ class VotClient:
     # -- основная логика ---------------------------------------------------- #
 
     def _resolve_source_lang(self, hint: str | None) -> str:
-        """Выбирает значение для --lang.
-
-        ``auto`` не работает вместе с живыми голосами (это прямо сказано в
-        релизе vot-cli 2.0.1), поэтому при включённых живых голосах ``auto``
-        заменяется на язык, определённый через yt-dlp, а если и его нет —
-        на ``vot.source_lang_fallback``.
-        """
         configured = (self._settings.source_lang or "auto").strip().lower()
         if configured != "auto":
             return configured
-        # Определённый yt-dlp язык предпочитается всегда, а не только при
-        # живых голосах: "auto" бэкенд Яндекса принимает не во всех режимах,
-        # а реальный код языка — всегда. Хвост локали отбрасывается:
-        # yt-dlp отдаёт "en-US", vot-cli ждёт "en".
         if hint:
             return hint.split("-")[0].strip().lower()
-        if self._settings.lively_voice:
-            return self._settings.source_lang_fallback
-        return "auto"
+        return self._settings.source_lang_fallback
 
     def _build_command(
         self,
@@ -211,60 +191,32 @@ class VotClient:
         *,
         kind: str,
         source_lang: str,
-        preview: bool,
-        outdir: Path | None,
+        outdir: Path,
     ) -> list[str]:
         settings = self._settings
-        command: list[str] = [settings.binary, "--json"]
+        cmd: list[str] = [
+            self._binary,
+            "--json",
+            f"--lang={source_lang}",
+            f"--reslang={settings.target_lang}",
+            "--voice-style=" + ("live" if settings.lively_voice else "tts"),
+        ]
 
-        if settings.flavor == "foswly":
-            # --no-visual намеренно НЕ передаётся. С ним vot-cli печатает
-            # только JSON вида {"ok":false,...}, в котором нет ни слова о
-            # причине отказа, и диагностировать нечего. Без него рядом с JSON
-            # остаётся читаемая строка («Failed to request create session»),
-            # по которой ошибка распознаётся и превращается во внятный совет.
-            # Разбор JSON из окружающего шума реализован в _extract_json.
-            command.append(f"--lang={source_lang}")
-            command.append(f"--reslang={settings.target_lang}")
-            if settings.lively_voice:
-                command.append("--lively-voice")
-            if settings.api_token:
-                command.append(f"--api-token={settings.api_token}")
-            if settings.proxy:
-                command.append(f"--proxy={settings.proxy}")
-            if settings.vot_host:
-                command.append(f"--vot-host={settings.vot_host}")
-            if settings.worker_host:
-                command.append(f"--worker-host={settings.worker_host}")
-            if kind == "subtitles":
-                command.append("--subs")
-                command.append(f"--subs-format={settings.subs_format}")
-            if preview:
-                command.append("--preview")
-            else:
-                assert outdir is not None
-                command.append(f"--outdir={outdir}")
-                # Имя по ID вместо названия ролика: названия бывают с эмодзи,
-                # кавычками и слешами, а результат мы всё равно ищем перебором.
-                command.append("--no-title")
-        else:  # flavor == "live" (fantomcheg/vot-cli-live)
-            command.append(f"--lang={source_lang}")
-            command.append(f"--reslang={settings.target_lang}")
-            command.append(
-                "--voice-style=" + ("live" if settings.lively_voice else "tts")
-            )
-            if settings.proxy:
-                command.append(f"--proxy={settings.proxy}")
-            if kind == "subtitles":
-                command.append("--subs")
-                if settings.subs_format == "srt":
-                    command.append("--subs-srt")
-            assert outdir is not None
-            command.append(f"--output={outdir}")
+        if settings.lively_voice and settings.force_live_voices:
+            cmd.append("--force-live-voices")
 
-        command.extend(settings.extra_args)
-        command.append(ref.url)
-        return command
+        if settings.proxy:
+            cmd.append(f"--proxy={settings.proxy}")
+
+        if kind == "subtitles":
+            cmd.append("--subs")
+            if settings.subs_format == "srt":
+                cmd.append("--subs-srt")
+
+        cmd.append(f"--output={outdir}")
+        cmd.extend(settings.extra_args)
+        cmd.append(ref.url)
+        return cmd
 
     async def _obtain(
         self,
@@ -279,9 +231,6 @@ class VotClient:
     ) -> VotArtifact:
         settings = self._settings
         resolved_lang = self._resolve_source_lang(source_lang)
-
-        # У форка нет режима --preview, поэтому там всегда путь со скачиванием.
-        use_preview = settings.use_preview and settings.flavor == "foswly"
 
         outdir = workdir / ("vot-subs" if kind == "subtitles" else "vot-audio")
         outdir.mkdir(parents=True, exist_ok=True)
@@ -307,30 +256,22 @@ class VotClient:
                 ref,
                 kind=kind,
                 source_lang=resolved_lang,
-                preview=use_preview,
-                outdir=None if use_preview else outdir,
+                outdir=outdir,
             )
 
-            if not use_preview:
-                # Прошлая попытка могла быть убита по таймауту прямо во время
-                # скачивания и оставить обрезанный файл. Он непустой, поэтому
-                # прошёл бы проверку в _try_extract и был бы отдан как готовый.
-                # Чистим каталог перед каждой попыткой.
-                _clear_directory(outdir)
+            _clear_directory(outdir)
 
             log.info(
                 "vot_attempt",
                 attempt=attempt,
                 kind=kind,
                 lang=resolved_lang,
-                preview=use_preview,
                 video=str(ref),
                 cmd=format_command(command),
             )
 
-            pending_reason = "перевод ещё готовится"
-            artifact_rejected = False
             result: ProcResult | None = None
+            pending_reason = "перевод ещё готовится"
 
             try:
                 result = await run_process(
@@ -345,47 +286,45 @@ class VotClient:
                 raise ToolMissing(settings.binary, str(exc)) from exc
             except ProcCancelled as exc:
                 raise JobCancelled() from exc
-            except ProcTimeout as exc:
-                # Таймаут попытки — это норма: vot-cli внутри ждёт бэкенд.
+            except ProcTimeout:
                 log.info("vot_attempt_timeout", attempt=attempt, kind=kind)
                 pending_reason = "Яндекс всё ещё переводит"
-                combined = exc.output
+                combined = ""
             except ProcError as exc:
                 raise TranslationUnavailable(str(exc)) from exc
             else:
-                combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
+                combined = "\n".join(
+                    part for part in (result.stdout, result.stderr) if part
+                )
 
-                artifact = await self._try_extract(
+                # 1. Пробуем извлечь файл из вывода.
+                artifact = await self._extract_artifact(
                     result,
                     combined,
                     kind=kind,
                     outdir=outdir,
-                    workdir=workdir,
                     cancel_event=cancel_event,
                     progress=progress,
                 )
-                if artifact is not None:
-                    # Бэкенд отвечает «успех» и отдаёт ссылку раньше, чем
-                    # перевод реально готов — по ней в этот момент лежит
-                    # заглушка. Без этой проверки она уезжала в ffmpeg и
-                    # роняла склейку с «Header missing», а настоящая причина
-                    # («подожди ещё») терялась. Забраковали — значит не готово.
-                    if kind == "subtitles":
-                        problem = _validate_subtitles(artifact)
-                    else:
-                        problem = _validate_audio(artifact, expected_duration_sec)
 
+                # 2. Парсим JSON, чтобы узнать verdict бэкенда.
+                payload = _extract_main_json(combined)
+                backend_success = _is_backend_success(payload)
+                backend_error = _get_backend_error(payload)
+
+                if artifact is not None and backend_success is not False:
+                    # 3. Валидация: реально ли файл готов или это заглушка.
+                    problem = _validate_artifact(artifact, kind, expected_duration_sec)
                     if problem is not None:
                         log.info(
-                            "vot_artifact_not_ready",
+                            "vot_artifact_rejected",
                             attempt=attempt,
                             kind=kind,
                             reason=problem,
-                            size=artifact.stat().st_size if artifact.exists() else 0,
+                            size=artifact.stat().st_size if artifact.is_file() else 0,
                         )
                         artifact.unlink(missing_ok=True)
                         pending_reason = "перевод ещё готовится"
-                        artifact_rejected = True
                     else:
                         waited = time.monotonic() - started
                         log.info(
@@ -404,55 +343,49 @@ class VotClient:
                             waited_sec=waited,
                         )
 
-                # Результата нет. Разбираемся: ждать или падать.
-                # Забракованный артефакт разбору не подлежит: бэкенд в этом
-                # случае отрапортовал успех, и в выводе нет ничего, что
-                # стоило бы классифицировать как ошибку.
-                fatal = None if artifact_rejected else classify_vot_output(combined)
-                if fatal is not None and not looks_like_translation_pending(combined):
-                    if kind == "subtitles" and isinstance(fatal, SubtitlesUnavailable):
-                        raise fatal
-                    log.info("vot_fatal", kind=kind, error=type(fatal).__name__)
-                    raise fatal
+                # 4. Классификация: ждать или падать.
+                transient = False
+                if backend_success is False and backend_error:
+                    if _is_fatal_error(backend_error):
+                        log.error(
+                            "vot_backend_refused",
+                            attempt=attempt,
+                            kind=kind,
+                            error=backend_error,
+                        )
+                        raise TranslationUnavailable(
+                            backend_error,
+                            user_message=(
+                                f"Яндекс не может перевести это видео: {backend_error}"
+                            ),
+                        )
+                    if _is_retryable_error(backend_error):
+                        log.info(
+                            "vot_transient_error",
+                            attempt=attempt,
+                            kind=kind,
+                            error=backend_error,
+                        )
+                        pending_reason = "Яндекс временно недоступен"
+                        transient = True
+                    else:
+                        log.warning(
+                            "vot_unknown_error",
+                            attempt=attempt,
+                            kind=kind,
+                            error=backend_error,
+                        )
 
-                # Недоделанная дорожка — это именно «ещё готовится», поэтому
-                # она не должна попадать в счётчик глухих отказов: иначе бот
-                # сдался бы через несколько попыток, не дождавшись перевода.
-                pending = artifact_rejected or looks_like_translation_pending(combined)
-
-                # Без этой строки диагностировать отказ невозможно: в логе
-                # оставалась только строка vot_attempt без единого намёка,
-                # почему попытка ничего не дала.
-                log.info(
-                    "vot_no_result",
-                    attempt=attempt,
-                    kind=kind,
-                    rc=result.returncode,
-                    pending=pending,
-                    output=combined[-500:].strip() or "<пусто>",
+                # pending = «перевод ещё готовится, надо подождать»
+                is_pending = transient or (
+                    (artifact is None and backend_success is True)
+                    or (artifact is None and backend_success is None
+                        and _looks_like_translation_pending(combined))
+                    or (artifact is not None and backend_success is not False)
                 )
 
-                if not pending:
+                if not is_pending:
                     hard_failures += 1
-
-                    # Код возврата у vot-cli недостоверен: при явном отказе он
-                    # отдаёт 0 в терминале и может отдать 1 без TTY. Поэтому
-                    # переключение на запасной путь НЕ завязано на result.ok —
-                    # раньше именно из-за этого фолбэк молча не срабатывал.
-                    if use_preview and hard_failures >= 2:
-                        log.warning(
-                            "vot_preview_unusable",
-                            hint="переключаюсь на режим скачивания файла",
-                            output=combined[-400:],
-                        )
-                        use_preview = False
-                        hard_failures = 0
-                        continue
-
-                    # Запасной путь уже испробован и тоже не помог. Крутиться
-                    # до общего таймаута бессмысленно — это не «ещё не готово»,
-                    # а устойчивый отказ. Сдаёмся и показываем, что ответила
-                    # утилита, вместо часа тишины.
                     if hard_failures >= _MAX_HARD_FAILURES:
                         log.error(
                             "vot_giving_up",
@@ -463,19 +396,26 @@ class VotClient:
                         raise TranslationUnavailable(
                             combined[-800:],
                             user_message=(
-                                "Яндекс отказался переводить этот ролик — "
+                                f"Яндекс отказался переводить — "
                                 f"{hard_failures} попыток подряд без результата.\n\n"
                                 "Ответ утилиты:\n"
-                                f"<code>{_short(combined)}</code>\n\n"
-                                "Если то же самое повторяется на любых роликах, "
-                                "проблема не в видео, а в доступе к бэкенду Яндекса — "
-                                "см. раздел «Диагностика» в README."
+                                f"<code>{_short(combined)}</code>"
                             ),
                         )
-                else:
+
+                log.info(
+                    "vot_no_result",
+                    attempt=attempt,
+                    kind=kind,
+                    rc=result.returncode if result else -1,
+                    pending=is_pending,
+                    output=combined[-500:].strip() or "<пусто>",
+                )
+
+                if is_pending:
                     hard_failures = 0
 
-            # Перевод ещё не готов — ждём с backoff.
+            # 4. Ждём с backoff и пробуем снова.
             if schedule.exhausted:
                 waited = time.monotonic() - started
                 raise TranslationTimeout(waited, attempt)
@@ -486,64 +426,71 @@ class VotClient:
                     f"{pending_reason} — попытка {attempt}, "
                     f"следующая через {delay:.0f} с"
                 )
-            log.debug("vot_wait", attempt=attempt, delay=round(delay, 1))
 
             try:
                 await sleep_with_cancel(delay, cancel_event)
             except CancelledByUser as exc:
                 raise JobCancelled() from exc
 
-    # -- разбор результата --------------------------------------------------- #
+    # -- извлечение результата ----------------------------------------------- #
 
-    async def _try_extract(
+    async def _extract_artifact(
         self,
         result: ProcResult,
         combined: str,
         *,
         kind: str,
         outdir: Path,
-        workdir: Path,
         cancel_event: asyncio.Event | None,
         progress: ProgressCallback,
     ) -> Path | None:
-        """Достаёт готовый файл из результата вызова. None — результата нет."""
+        """Извлекает готовый файл из результата вызова.
+
+        Принципиально: НИКОГДА не скачивает audioUrl самостоятельно.
+        Если форк не сохранил файл в --output — значит перевод ещё не готов,
+        и audioUrl — это ссылка на заглушку Яндекса. Единственный надёжный
+        признак готовности — файл, записанный самим fork-ом в каталог.
+        """
         suffixes = _SUBS_SUFFIXES if kind == "subtitles" else _AUDIO_SUFFIXES
 
-        # 1. Файл, который vot-cli уже положил на диск.
         found = _newest_file(outdir, suffixes)
-        if found is not None and found.stat().st_size > 0:
+        if found is not None:
             return found
 
-        payload = _extract_json(result.stdout) or _extract_json(combined)
-
-        # 2. Путь к файлу, указанный в JSON (может быть вне outdir).
-        if payload is not None:
-            for candidate in _collect_values(payload, _PATH_KEYS):
-                path = Path(candidate)
-                if path.is_file() and path.stat().st_size > 0:
-                    return path
-
-        # 3. Прямая ссылка — скачиваем сами.
-        url = None
-        if payload is not None:
-            url = _first_url(_collect_values(payload, _URL_KEYS))
-        if url is None and result.ok:
-            # Некоторые версии печатают голую ссылку без JSON.
-            url = _first_url(_HTTP_URL_RE.findall(result.stdout))
-
-        if url is None:
-            return None
-
+        # Файла нет. Для субтитров пробуем скачать (там нет проблемы заглушек).
         if kind == "subtitles":
-            target = outdir / ("subtitles" + _suffix_for(kind, self._settings))
-        else:
-            target = outdir / "translation.mp3"
+            payload = _extract_main_json(combined)
+            if payload is not None and isinstance(payload, dict):
+                url = _find_any_url(payload)
+                if url is not None:
+                    target = outdir / "downloaded.srt"
+                    try:
+                        await self._download(
+                            url, target,
+                            cancel_event=cancel_event,
+                            progress=progress,
+                        )
+                    except (DownloadFailed, JobCancelled):
+                        target.unlink(missing_ok=True)
+                        return None
+                    if target.stat().st_size > 0:
+                        return target
+                    target.unlink(missing_ok=True)
 
-        await self._download(url, target, cancel_event=cancel_event, progress=progress)
-        if target.stat().st_size == 0:
-            target.unlink(missing_ok=True)
-            return None
-        return target
+        # Для аудио: нет файла → перевод ещё не готов. Ждём следующей попытки.
+        if kind == "audio":
+            payload = _extract_main_json(combined)
+            audio_url = None
+            if isinstance(payload, dict):
+                audio_url = payload.get("audioUrl") or ""
+            if audio_url:
+                log.info(
+                    "vot_no_local_file_audioUrl_present",
+                    hint="Yandex returned audioUrl but fork did not save the file "
+                         "— translation is not ready yet, will poll",
+                )
+
+        return None
 
     async def _download(
         self,
@@ -553,18 +500,17 @@ class VotClient:
         cancel_event: asyncio.Event | None,
         progress: ProgressCallback,
     ) -> None:
-        """Скачивает результат перевода с ретраями и докачкой с нуля."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".part")
+        downloaded = 0
+        last_report = 0.0
 
-        async def _once() -> None:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_suffix(target.suffix + ".part")
-            downloaded = 0
-            last_report = 0.0
+        try:
             async with self._http.stream("GET", url) as response:
                 response.raise_for_status()
                 total = int(response.headers.get("content-length") or 0)
                 with temporary.open("wb") as handle:
-                    async for chunk in response.aiter_bytes(chunk_size=1024 * 256):
+                    async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
                         if cancel_event is not None and cancel_event.is_set():
                             raise JobCancelled()
                         handle.write(chunk)
@@ -582,115 +528,107 @@ class VotClient:
                                     f"качаю дорожку: {downloaded / 1024**2:.1f} МБ"
                                 )
             temporary.replace(target)
-
-        try:
-            await retry_async(
-                _once,
-                attempts=4,
-                exceptions=(httpx.HTTPError, OSError),
-                start=3.0,
-                factor=2.0,
-                maximum=30.0,
-                cancel_event=cancel_event,
-                description="скачивание дорожки перевода",
-            )
-        except CancelledByUser as exc:
-            raise JobCancelled() from exc
-        except (httpx.HTTPError, OSError) as exc:
+        except httpx.HTTPError as exc:
             raise DownloadFailed(f"не удалось скачать {url}: {exc}") from exc
+        except OSError as exc:
+            raise DownloadFailed(f"ошибка при сохранении {target}: {exc}") from exc
 
 
 # --------------------------------------------------------------------------- #
-#  Разбор JSON и файлов
+#  Разбор JSON из перемешанного вывода vot-cli-live
 # --------------------------------------------------------------------------- #
 
+# Строка с субтитрами в выводе: «Subtitles response (URL): <JSON_ARRAY>»
+_SUBS_RESPONSE_RE = re.compile(
+    r"Subtitles\s+response\s*\([^)]*\)\s*:\s*(\[.+?\])", re.IGNORECASE | re.DOTALL
+)
 
-def _suffix_for(kind: str, settings: VotSettings) -> str:
-    if kind != "subtitles":
-        return ".mp3"
-    return {"srt": ".srt", "vtt": ".vtt", "json": ".json"}.get(settings.subs_format, ".srt")
 
+def _extract_main_json(text: str) -> Any | None:
+    """Достаёт основной JSON из вывода — массив результата перевода.
 
-def _extract_json(text: str) -> Any | None:
-    """Достаёт JSON-объект из вывода, даже если вокруг него есть мусор.
-
-    vot-cli печатает прогресс через listr2, поэтому чистого JSON на stdout
-    может и не быть. Перебираем все позиции '{' и '[' и берём объект,
-    съевший больше всего текста, — это внешний объект ответа, а не вложенный
-    в него элемент ``results[]``. Если брать «последний успешно разобранный»,
-    выигрывал бы как раз вложенный, потому что он идёт позже по строке.
+    vot-cli-live печатает JSON-массив `[{...}]`. В режиме субтитров перед ним
+    может идти «Subtitles response (URL): [...]» — это отдельный блок.
+    Берём последний найденный JSON-массив (после строки субтитров).
     """
     if not text:
         return None
 
-    stripped = text.strip()
-    try:
-        return json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
-        pass
-
+    # Ищем все JSON-массивы: [{...}]
     decoder = json.JSONDecoder()
-    best: Any | None = None
-    best_length = 0
-    for index, character in enumerate(text):
-        if character not in "{[":
+    candidates: list[dict] = []
+
+    for idx, ch in enumerate(text):
+        if ch != "[":
             continue
         try:
-            value, end = decoder.raw_decode(text[index:])
+            value, _ = decoder.raw_decode(text[idx:])
         except (json.JSONDecodeError, ValueError):
             continue
-        if isinstance(value, (dict, list)) and end > best_length:
-            best, best_length = value, end
-    return best
+        if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+            candidates.append(value[0])
+
+    if not candidates:
+        return None
+
+    # Возвращаем последний валидный (основной ответ, не subtitles вложенный).
+    return candidates[-1]
 
 
-def _walk(node: Any) -> Iterable[tuple[str, Any]]:
-    """Рекурсивно обходит структуру, выдавая пары (имя ключа в нижнем регистре, значение)."""
-    if isinstance(node, dict):
-        for key, value in node.items():
-            yield str(key).lower(), value
-            yield from _walk(value)
-    elif isinstance(node, list):
-        for item in node:
-            yield from _walk(item)
-
-
-def _collect_values(payload: Any, keys: tuple[str, ...]) -> list[str]:
-    """Собирает строковые значения по интересующим ключам, сохраняя порядок."""
-    wanted = set(keys)
-    found: list[str] = []
-    for key, value in _walk(payload):
-        if key in wanted and isinstance(value, str) and value.strip():
-            found.append(value.strip())
-    return found
-
-
-def _first_url(candidates: Iterable[str]) -> str | None:
-    for candidate in candidates:
-        candidate = candidate.strip().rstrip(",;")
-        if candidate.lower().startswith(("http://", "https://")):
-            return candidate
+def _find_any_url(payload: dict) -> str | None:
+    """Рекурсивно ищет первую HTTP-ссылку в структуре JSON."""
+    for _, value in _walk_dict(payload):
+        if isinstance(value, str) and value.startswith("https://"):
+            return value
     return None
 
 
-#: Сигнатуры начала MP3: тег ID3 либо синхрослово кадра (11 единичных бит).
-_MP3_MAGIC: tuple[bytes, ...] = (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2", b"\xff\xfa")
-
-#: Минимальный правдоподобный битрейт речевой дорожки, байт в секунду.
-#: Яндекс отдаёт около 16 кБ/с; порог занижен втрое с запасом, чтобы ловить
-#: только явные подделки, а не законно тихие или сильно сжатые дорожки.
-_MIN_AUDIO_BYTES_PER_SEC = 700
+def _walk_dict(node: Any) -> list[tuple[str, Any]]:
+    """Плоский список (ключ, значение) с рекурсивным обходом."""
+    result: list[tuple[str, Any]] = []
+    _walk_recursive(node, result)
+    return result
 
 
-def _validate_audio(path: Path, expected_duration_sec: float | None) -> str | None:
-    """Проверяет, что файл действительно похож на звуковую дорожку.
+def _walk_recursive(node: Any, acc: list[tuple[str, Any]]) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            acc.append((str(key).lower(), value))
+            _walk_recursive(value, acc)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_recursive(item, acc)
 
-    Нужно, потому что бэкенд отвечает «успех» и отдаёт ссылку ещё до того,
-    как перевод фактически готов: по ссылке в этот момент лежит заглушка.
-    Без проверки она уезжала в ffmpeg и роняла склейку с невнятным
-    «Header missing», хотя настоящая причина — «подожди ещё немного».
 
-    :returns: причину отбраковки или None, если файл выглядит правдоподобно.
+# --------------------------------------------------------------------------- #
+#  Валидация артефакта через ffprobe
+# --------------------------------------------------------------------------- #
+
+def _validate_artifact(
+    path: Path, kind: str, expected_duration_sec: float | None
+) -> str | None:
+    """Проверяет, что файл — настоящий аудио/субтитры, а не заглушка.
+
+    :returns: причину отбраковки или None, если файл валиден.
+    """
+    if kind == "subtitles":
+        return _validate_subtitles(path)
+
+    if kind == "audio":
+        return _validate_audio_ffprobe(path, expected_duration_sec)
+
+    return None
+
+
+def _validate_audio_ffprobe(
+    path: Path, expected_duration_sec: float | None
+) -> str | None:
+    """Проверяет аудиофайл через ffprobe.
+
+    Ключевое отличие от проверки по сигнатуре байт: заглушка, которую Яндекс
+    отдаёт до готовности перевода, может начинаться с корректного MP3-заголовка,
+    но иметь гротескно малую длительность или вовсе не декодироваться.
+    ffprobe надёжнее.
     """
     try:
         size = path.stat().st_size
@@ -700,29 +638,142 @@ def _validate_audio(path: Path, expected_duration_sec: float | None) -> str | No
     if size < 4096:
         return f"слишком маленький файл ({size} Б)"
 
+    # Быстрая проверка: настоящие аудиоданные не начинаются с <, {, [ и т.п.
     try:
         with path.open("rb") as handle:
             head = handle.read(4)
     except OSError as exc:
         return f"не удалось прочитать: {exc}"
 
-    if not any(head.startswith(magic) for magic in _MP3_MAGIC):
-        # Заглушки и страницы ошибок начинаются с '<', '{' и подобного.
-        return f"это не MP3 (первые байты: {head!r})"
+    if head and head[0:1] in (b"<", b"{", b"["):
+        return f"похоже на HTML/JSON, а не аудио (первые байты: {head!r})"
+
+    # ffprobe проверка
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
+                str(path),
+            ],
+            capture_output=True,
+            timeout=30,
+            text=True,
+        )
+    except FileNotFoundError:
+        log.warning("ffprobe not found, falling back to basic checks")
+        return _validate_audio_basic(path, expected_duration_sec)
+    except subprocess.TimeoutExpired:
+        return "ffprobe завис на файле"
+    except OSError as exc:
+        return f"ffprobe ошибка: {exc}"
+
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "")[-200:]
+        return f"ffprobe не смог прочитать файл: {stderr_tail.strip()}"
+
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return "ffprobe вернул не-JSON"
+
+    streams = data.get("streams") or []
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+
+    if not audio_streams:
+        if any(s.get("codec_type") == "video" for s in streams):
+            return "в файле только видео, но не аудио"
+        return "ffprobe не нашёл аудиопотоков"
+
+    # Проверяем sample_rate и channels: у заглушек они нулевые
+    first_audio = audio_streams[0]
+    if int(first_audio.get("sample_rate", 0) or 0) == 0:
+        return "sample_rate=0 (заглушка)"
+    if int(first_audio.get("channels", 0) or 0) == 0:
+        return "channels=0 (заглушка)"
+
+    # Проверяем длительность
+    fmt = data.get("format") or {}
+    duration_str = fmt.get("duration")
+    if duration_str is not None:
+        try:
+            actual_duration = float(duration_str)
+        except (TypeError, ValueError):
+            actual_duration = None
+    else:
+        # Пробуем из первого аудиопотока
+        actual_duration = None
+        for stream in audio_streams:
+            dur = stream.get("duration")
+            if dur is not None:
+                try:
+                    actual_duration = float(dur)
+                except (TypeError, ValueError):
+                    pass
+                break
+
+    if actual_duration is None:
+        # Заглушки из нулевых байт дают 0.0 с, но чаще — просто не имеют
+        # поля duration вообще. И то, и другое — признак неготовности.
+        return "длительность не определена (заглушка)"
+
+    if actual_duration <= 0.5:
+        return f"длительность почти нулевая: {actual_duration:.2f} с"
 
     if expected_duration_sec and expected_duration_sec > 0:
-        minimum = int(expected_duration_sec * _MIN_AUDIO_BYTES_PER_SEC)
+        diff = abs(actual_duration - expected_duration_sec)
+        max_diff = expected_duration_sec * _DURATION_TOLERANCE
+        if diff > max_diff and actual_duration < expected_duration_sec * 0.3:
+            return (
+                f"дорожка значительно короче видео: "
+                f"{actual_duration:.0f} с вместо {expected_duration_sec:.0f} с"
+            )
+
+    # Проверяем битрейт: заглушки имеют аномально низкий битрейт.
+    bitrate_str = fmt.get("bit_rate")
+    if bitrate_str is not None and actual_duration is not None and actual_duration > 0:
+        try:
+            bitrate = int(bitrate_str)
+        except (TypeError, ValueError):
+            bitrate = None
+        if bitrate is not None and bitrate < 8000:  # 8 kbps — ниже речи не бывает
+            return f"подозрительно низкий битрейт: {bitrate} бит/с"
+
+    return None
+
+
+def _validate_audio_basic(
+    path: Path, expected_duration_sec: float | None
+) -> str | None:
+    """Запасная проверка без ffprobe: размер файла относительно длительности."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"файл недоступен: {exc}"
+
+    if size < 4096:
+        return f"слишком маленький файл ({size} Б)"
+
+    if expected_duration_sec and expected_duration_sec > 0:
+        min_bytes_per_sec = 700
+        minimum = int(expected_duration_sec * min_bytes_per_sec)
         if size < minimum:
             return (
                 f"дорожка короче ожидаемого: {size / 1024**2:.2f} МБ при "
                 f"минимуме {minimum / 1024**2:.2f} МБ на "
                 f"{expected_duration_sec / 60:.0f} мин видео"
             )
+
     return None
 
 
 def _validate_subtitles(path: Path) -> str | None:
-    """Беглая проверка субтитров: в SRT и VTT обязана быть стрелка тайминга."""
+    """Беглая проверка субтитров."""
     try:
         if path.stat().st_size < 16:
             return "пустой файл субтитров"
@@ -730,13 +781,18 @@ def _validate_subtitles(path: Path) -> str | None:
             head = handle.read(4096)
     except OSError as exc:
         return f"не удалось прочитать: {exc}"
+
     if path.suffix.lower() == ".json":
         return None if head.lstrip().startswith(("{", "[")) else "это не JSON"
+
     return None if "-->" in head else "в файле нет таймингов субтитров"
 
 
+# --------------------------------------------------------------------------- #
+#  Вспомогательные: файлы, директории, анализ ошибок
+# --------------------------------------------------------------------------- #
+
 def _clear_directory(directory: Path) -> None:
-    """Опустошает каталог, не удаляя его самого. Ошибки игнорируются."""
     if not directory.is_dir():
         directory.mkdir(parents=True, exist_ok=True)
         return
@@ -751,7 +807,6 @@ def _clear_directory(directory: Path) -> None:
 
 
 def _newest_file(directory: Path, suffixes: tuple[str, ...]) -> Path | None:
-    """Самый свежий непустой файл с подходящим расширением."""
     if not directory.is_dir():
         return None
     best: Path | None = None
@@ -768,3 +823,50 @@ def _newest_file(directory: Path, suffixes: tuple[str, ...]) -> Path | None:
         if stat.st_mtime > best_mtime:
             best, best_mtime = entry, stat.st_mtime
     return best
+
+
+def _is_backend_success(payload: Any) -> bool | None:
+    """Возвращает значение поля success из JSON. None — JSON не найден."""
+    if isinstance(payload, dict):
+        val = payload.get("success")
+        if isinstance(val, bool):
+            return val
+    return None
+
+
+def _get_backend_error(payload: Any) -> str | None:
+    """Возвращает текст ошибки из JSON. None — нет ошибки."""
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, str) and err.strip():
+            return err.strip()
+    return None
+
+
+def _is_fatal_error(error_text: str) -> bool:
+    """True, если ошибка означает «это видео нельзя перевести»."""
+    for pattern in _FATAL_ERROR_PATTERNS:
+        if pattern.search(error_text):
+            return True
+    return False
+
+
+def _is_retryable_error(error_text: str) -> bool:
+    """True, если ошибка временная (сеть, таймаут) — надо повторить."""
+    for pattern in _RETRYABLE_ERROR_PATTERNS:
+        if pattern.search(error_text):
+            return True
+    return False
+
+
+def _looks_like_translation_pending(text: str) -> bool:
+    """True, если вывод похож на «перевод ещё не готов, подожди»."""
+    if not text:
+        return False
+    lowered = text.lower()
+    markers = (
+        "wait", "pending", "in progress", "not ready", "preparing",
+        "translating", "processing", "очеред", "ожида", "готов",
+        "переводится", "подожди",
+    )
+    return any(marker in lowered for marker in markers)
