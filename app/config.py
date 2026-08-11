@@ -226,10 +226,16 @@ class VotSettings(_Base):
     target_lang: str = "ru"
     lively_voice: bool = False
     force_live_voices: bool = False
-    api_token: str = ""
     proxy: str = ""
     # Устаревшие поля — оставлены для совместимости со старыми config.yaml,
     # больше не читаются кодом. Удалить после перехода всех серверов.
+    #
+    # api_token: у vot-cli-live нет ни одного флага для токена или авторизации
+    # (проверено по --help версии 1.7.5). Аутентифицироваться форк не умеет,
+    # поэтому живые голоса он получает только там, где Яндекс отдаёт их
+    # анонимно. Флаг --api-token есть у foswly/vot-cli, но та реализация
+    # нерабочая — см. flavor.
+    api_token: str = ""
     vot_host: str = ""
     worker_host: str = ""
     use_preview: bool = True
@@ -272,6 +278,15 @@ class VotSettings(_Base):
             warnings.warn(
                 "vot.vot_host is deprecated — the live fork connects to "
                 "api.browser.yandex.ru directly and does not use a proxy host. "
+                "Remove from config.yaml.",
+                FutureWarning, stacklevel=2,
+            )
+        if self.api_token:
+            warnings.warn(
+                "vot.api_token is deprecated — vot-cli-live has no flag for a "
+                "token or any other authentication (checked against --help of "
+                "1.7.5), so the value is never sent anywhere. Live voices are "
+                "granted only where Yandex hands them out anonymously. "
                 "Remove from config.yaml.",
                 FutureWarning, stacklevel=2,
             )
