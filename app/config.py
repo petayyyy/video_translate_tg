@@ -220,7 +220,7 @@ class PathsSettings(_Base):
 
 class VotSettings(_Base):
     binary: str = "vot-cli"
-    flavor: Literal["foswly", "live"] = "foswly"
+    flavor: Literal["foswly", "live"] = "live"
     source_lang: str = "auto"
     source_lang_fallback: str = "en"
     target_lang: str = "ru"
@@ -228,6 +228,8 @@ class VotSettings(_Base):
     force_live_voices: bool = False
     api_token: str = ""
     proxy: str = ""
+    # Устаревшие поля — оставлены для совместимости со старыми config.yaml,
+    # больше не читаются кодом. Удалить после перехода всех серверов.
     vot_host: str = ""
     worker_host: str = ""
     use_preview: bool = True
@@ -241,17 +243,49 @@ class VotSettings(_Base):
     extra_args: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def _resolve_binary(self) -> "VotSettings":
-        """Подставляет исполняемый файл, соответствующий выбранной реализации.
+    def _check_flavor_deprecated(self) -> "VotSettings":
+        """foswly/vot-cli 2.x неработоспособен: домен vot.toil.cc — NXDOMAIN.
 
-        Иначе смена одного только ``flavor: live`` приводила бы к запуску
-        всё того же ``vot-cli`` с флагами форка — отказ был бы невнятным.
-        Явно указанный ``binary`` не трогаем.
-
-        Запись идёт мимо валидации намеренно: при ``validate_assignment=True``
-        обычное присваивание внутри mode="after" запустило бы проверку заново.
+        Используется только fantomcheg/vot-cli-live (flavor: live).
+        Явное указание flavor: foswly — ошибка конфигурации.
         """
-        if self.flavor == "live" and self.binary == "vot-cli":
+        if self.flavor == "foswly":
+            raise ValueError(
+                "vot.flavor: foswly больше не поддерживается. "
+                "Домен vot.toil.cc, через который foswly/vot-cli ходил к Яндексу, "
+                "не резолвится (authoritative NXDOMAIN). "
+                "Используй flavor: live — fantomcheg/vot-cli-live, "
+                "который обращается к api.browser.yandex.ru напрямую. "
+                "Если строка уже была flavor: live, просто удали flavour из конфига."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _deprecation_notice(self) -> "VotSettings":
+        """Предупреждает о полях, которые больше не читаются кодом.
+
+        Эти поля оставлены для совместимости со старыми config.yaml.
+        После обновления всех серверов их можно удалить вместе с этим валидатором.
+        """
+        import warnings
+        if self.vot_host:
+            warnings.warn(
+                "vot.vot_host is deprecated — the live fork connects to "
+                "api.browser.yandex.ru directly and does not use a proxy host. "
+                "Remove from config.yaml.",
+                FutureWarning, stacklevel=2,
+            )
+        if self.worker_host:
+            warnings.warn(
+                "vot.worker_host is deprecated — the live fork does not use it. "
+                "Remove from config.yaml.",
+                FutureWarning, stacklevel=2,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _resolve_binary(self) -> "VotSettings":
+        if self.binary == "vot-cli":
             self.__dict__["binary"] = "vot-cli-live"
         return self
 
