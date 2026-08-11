@@ -12,10 +12,25 @@ MOCK_BINARY = "/home/ilyah/.local/bin/vot-cli-mock"
 REAL_AUDIO = "/tmp/real_audio.mp3"
 COUNT_FILE = "/tmp/vot_mock_convergence_count"
 
-os.environ["VOT_MOCK_STUBS"] = "3"       # first 3 calls = stubs
+os.environ["VOT_MOCK_STUBS"] = "3"
 os.environ["VOT_MOCK_COUNT_FILE"] = COUNT_FILE
 os.environ["VOT_MOCK_REAL_AUDIO"] = REAL_AUDIO
 os.environ["VOT_MOCK_DELAY"] = "0.3"
+
+def _ensure_real_audio():
+    if Path(REAL_AUDIO).is_file():
+        return
+    import shutil
+    r = subprocess.run(
+        ["vot-cli-live", "--json", "--lang=en", "--reslang=ru",
+         "--voice-style=live", "--output=/tmp/mock_ensure",
+         "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+        capture_output=True, timeout=60, text=True,
+    )
+    for f in Path("/tmp/mock_ensure").glob("*.mp3"):
+        shutil.copy2(str(f), REAL_AUDIO)
+        break
+    shutil.rmtree("/tmp/mock_ensure", ignore_errors=True)
 
 GREEN = "\033[32m"
 RED = "\033[31m"
@@ -31,6 +46,7 @@ async def main():
     # Reset count
     Path(COUNT_FILE).write_text("0")
 
+    _ensure_real_audio()
     assert Path(REAL_AUDIO).is_file(), "Real audio not found at {}".format(REAL_AUDIO)
     # Verify real audio is valid MP3
     r = subprocess.run(
