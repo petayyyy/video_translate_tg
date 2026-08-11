@@ -192,17 +192,21 @@ class VotClient:
         kind: str,
         source_lang: str,
         outdir: Path,
+        live_voices: bool | None = None,
     ) -> list[str]:
         settings = self._settings
+        # live_voices передаётся явно, потому что по ходу опроса бот может
+        # откатиться с живых голосов на обычный синтез, не трогая конфиг.
+        use_live = settings.lively_voice if live_voices is None else live_voices
         cmd: list[str] = [
             self._binary,
             "--json",
             f"--lang={source_lang}",
             f"--reslang={settings.target_lang}",
-            "--voice-style=" + ("live" if settings.lively_voice else "tts"),
+            "--voice-style=" + ("live" if use_live else "tts"),
         ]
 
-        if settings.lively_voice and settings.force_live_voices:
+        if use_live and settings.force_live_voices:
             cmd.append("--force-live-voices")
 
         if settings.proxy:
@@ -246,6 +250,9 @@ class VotClient:
 
         attempt = 0
         hard_failures = 0
+        # Может смениться по ходу опроса: если для ролика нет живых голосов,
+        # откатываемся на обычный синтез вместо того, чтобы падать.
+        use_live_voices = settings.lively_voice
 
         while True:
             attempt += 1
@@ -257,6 +264,7 @@ class VotClient:
                 kind=kind,
                 source_lang=resolved_lang,
                 outdir=outdir,
+                live_voices=use_live_voices,
             )
 
             _clear_directory(outdir)
@@ -338,7 +346,7 @@ class VotClient:
                             path=artifact,
                             kind=kind,
                             source_lang=resolved_lang,
-                            lively_voice=settings.lively_voice,
+                            lively_voice=use_live_voices,
                             attempts=attempt,
                             waited_sec=waited,
                         )
@@ -347,6 +355,28 @@ class VotClient:
                 transient = False
                 if backend_success is False and backend_error:
                     if _is_fatal_error(backend_error):
+                        # Живые голоса есть не у всех роликов, и форк сообщает
+                        # об их отсутствии тем же «Translation not available»,
+                        # что и о полной невозможности перевода. Отличить одно
+                        # от другого можно только попыткой: откатываемся на
+                        # обычный синтез, прежде чем объявлять ролик
+                        # непереводимым. Голоса — предпочтение, а не условие.
+                        if use_live_voices:
+                            log.warning(
+                                "vot_live_voices_unavailable",
+                                attempt=attempt,
+                                kind=kind,
+                                error=backend_error,
+                                hint="повторяю с обычным синтезом",
+                            )
+                            use_live_voices = False
+                            if progress is not None:
+                                await progress(
+                                    "живых голосов для этого ролика нет — "
+                                    "перехожу на обычный синтез"
+                                )
+                            continue
+
                         log.error(
                             "vot_backend_refused",
                             attempt=attempt,
