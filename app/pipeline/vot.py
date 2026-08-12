@@ -67,10 +67,32 @@ _FATAL_ERROR_PATTERNS = (
     re.compile(r"no\s+(?:subtitles|субтитр)", re.IGNORECASE),
 )
 
+# Ответы, которые сообщают о СОСТОЯНИИ перевода, а не об отказе. Проверяются
+# раньше всех прочих: это не ошибки, а «ещё не готово, зайди позже».
+#
+# Форк реализует всего четыре статуса Яндекса — 0 (ошибка), 1 (успех),
+# 2 (в процессе), 7 (недоступно, — и все остальные сваливает в заглушку
+# "Unknown translation status: N". Наблюдался статус 6, после которого тот же
+# ролик спустя время переводился нормально: это очередь либо ограничение
+# частоты запросов, а вовсе не отказ.
+#
+# Статус 2 сюда же: «перевод займёт несколько минут» — нормальное рабочее
+# состояние, а не повод сдаваться.
+_PENDING_STATUS_PATTERNS = (
+    re.compile(r"unknown\s+translation\s+status", re.IGNORECASE),
+    re.compile(r"translation\s+will\s+take", re.IGNORECASE),
+    re.compile(r"(?:few|several)\s+minutes|несколько\s+минут", re.IGNORECASE),
+    re.compile(r"in\s+progress|processing|queued|в\s+очеред", re.IGNORECASE),
+    re.compile(r"too\s+many\s+requests|rate\s*limit|\b429\b", re.IGNORECASE),
+)
+
 # Ошибки, которые означают «сеть/сервер временно недоступен» — надо повторить.
 _RETRYABLE_ERROR_PATTERNS = (
     re.compile(r"timed\s*out|etimedout|econnrefused|econnreset|enotfound|eai_again", re.IGNORECASE),
-    re.compile(r"failed\s+to\s+(?:request|create)\s+session", re.IGNORECASE),
+    # Реальное сообщение форка — "Failed to request create session", то есть
+    # оба слова подряд. Шаблон с (?:request|create) его не ловил: он ожидал
+    # одно из двух, а не оба.
+    re.compile(r"failed\s+to\s+(?:request\s+)?(?:create\s+)?session", re.IGNORECASE),
     re.compile(r"(?:network|connection)\s+(?:error|refused|reset)", re.IGNORECASE),
     re.compile(r"(?:5\d\d|server\s+error)", re.IGNORECASE),
 )
@@ -354,7 +376,21 @@ class VotClient:
                 # 4. Классификация: ждать или падать.
                 transient = False
                 if backend_success is False and backend_error:
-                    if _is_fatal_error(backend_error):
+                    # Сообщение о состоянии перевода проверяется первым:
+                    # "Unknown translation status: N" и "translation will take
+                    # a few minutes" — это «ещё не готово», а не отказ. Раньше
+                    # они попадали в разряд неизвестных ошибок, и бот сдавался
+                    # через четыре попытки, не дождавшись перевода.
+                    if _is_pending_status(backend_error):
+                        log.info(
+                            "vot_status_pending",
+                            attempt=attempt,
+                            kind=kind,
+                            status=backend_error,
+                        )
+                        pending_reason = "Яндекс ещё готовит перевод"
+                        transient = True
+                    elif _is_fatal_error(backend_error):
                         # Живые голоса есть не у всех роликов, и форк сообщает
                         # об их отсутствии тем же «Translation not available»,
                         # что и о полной невозможности перевода. Отличить одно
@@ -389,7 +425,7 @@ class VotClient:
                                 f"Яндекс не может перевести это видео: {backend_error}"
                             ),
                         )
-                    if _is_retryable_error(backend_error):
+                    elif _is_retryable_error(backend_error):
                         log.info(
                             "vot_transient_error",
                             attempt=attempt,
@@ -871,6 +907,19 @@ def _get_backend_error(payload: Any) -> str | None:
         if isinstance(err, str) and err.strip():
             return err.strip()
     return None
+
+
+def _is_pending_status(error_text: str) -> bool:
+    """True, если бэкенд сообщает о состоянии перевода, а не об отказе.
+
+    Проверяется РАНЬШЕ ``_is_fatal_error``: форк складывает всё, чего не
+    понимает, в строку вида "Unknown translation status: 6", и принимать её
+    за приговор нельзя — тот же ролик спустя время переводится.
+    """
+    for pattern in _PENDING_STATUS_PATTERNS:
+        if pattern.search(error_text):
+            return True
+    return False
 
 
 def _is_fatal_error(error_text: str) -> bool:
